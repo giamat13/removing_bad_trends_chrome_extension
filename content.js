@@ -1,7 +1,6 @@
 let REPLACEMENTS = [];
 let ALLOWLIST = [];
 
-// placeholder ייחודי שלא יתנגש עם תוכן אמיתי
 const PLACEHOLDER_PREFIX = "\x00ALLOW_";
 const PLACEHOLDER_SUFFIX = "\x00";
 
@@ -24,31 +23,26 @@ function loadReplacements() {
 
 function applyWithAllowlist(text) {
   if (ALLOWLIST.length === 0) {
-    // אין allowlist, פשוט תחליף
     for (const [pattern, replacement] of REPLACEMENTS) {
       text = text.replaceAll(pattern, replacement);
     }
     return text;
   }
 
-  // שלב 1: החלף מילים ב-allowlist ב-placeholder זמני
   const placeholderMap = {};
   ALLOWLIST.forEach((word, i) => {
     const placeholder = `${PLACEHOLDER_PREFIX}${i}${PLACEHOLDER_SUFFIX}`;
-    // החלפה case-insensitive
     const regex = new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
     text = text.replace(regex, (match) => {
-      placeholderMap[placeholder] = match; // שמור את המקרה המקורי
+      placeholderMap[placeholder] = match;
       return placeholder;
     });
   });
 
-  // שלב 2: הפעל את כל ה-block replacements
   for (const [pattern, replacement] of REPLACEMENTS) {
     text = text.replaceAll(pattern, replacement);
   }
 
-  // שלב 3: החזר את מילות ה-allowlist המקוריות
   for (const [placeholder, original] of Object.entries(placeholderMap)) {
     text = text.replaceAll(placeholder, original);
   }
@@ -67,23 +61,17 @@ function replaceInTextNode(node) {
   }
 }
 
-function nodeHasMatch(node) {
-  const t = originalText.get(node) ?? node.textContent;
-  return REPLACEMENTS.some(([p]) =>
-    typeof p === "string" ? t.includes(p) : p.test(t)
-  );
-}
-
-function isInteractive(node) {
+function isInputField(node) {
   const parent = node.parentElement;
   if (!parent) return true;
   const tag = parent.tagName;
-  return (
-    tag === "INPUT" ||
-    tag === "TEXTAREA" ||
-    parent.isContentEditable ||
-    !!parent.closest("[contenteditable]")
-  );
+  if (tag === "INPUT" || tag === "TEXTAREA") return true;
+
+  // רק אם ההורה הישיר הוא contenteditable — לא הורים רחוקים יותר
+  // זה מונע חסימת הודעות צ'אט שנמצאות *בתוך* אזור שיש בו שדה קלט
+  if (parent.isContentEditable && parent.getAttribute("contenteditable") === "true") return true;
+
+  return false;
 }
 
 function walkDOM(root) {
@@ -98,7 +86,7 @@ function walkDOM(root) {
         if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
           return NodeFilter.FILTER_REJECT;
         }
-        if (isInteractive(node)) return NodeFilter.FILTER_REJECT;
+        if (isInputField(node)) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
     }
@@ -109,12 +97,25 @@ function walkDOM(root) {
   nodes.forEach(replaceInTextNode);
 }
 
-function startObserver() {
+// תמיכה ב-Shadow DOM (נדרש עבור YouTube Live Chat)
+function walkShadowDOM(root) {
+  walkDOM(root);
+
+  const elements = root.querySelectorAll("*");
+  for (const el of elements) {
+    if (el.shadowRoot) {
+      walkDOM(el.shadowRoot);
+      walkShadowDOM(el.shadowRoot);
+    }
+  }
+}
+
+function observeTarget(target) {
   const observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       if (mutation.type === "characterData") {
         const node = mutation.target;
-        if (!isInteractive(node)) {
+        if (!isInputField(node)) {
           originalText.set(node, node.textContent);
           replaceInTextNode(node);
         }
@@ -122,28 +123,65 @@ function startObserver() {
       }
       for (const node of mutation.addedNodes) {
         if (node.nodeType === Node.TEXT_NODE) {
-          if (!isInteractive(node)) replaceInTextNode(node);
+          if (!isInputField(node)) replaceInTextNode(node);
         } else if (node.nodeType === Node.ELEMENT_NODE) {
-          walkDOM(node);
+          // בדוק גם Shadow DOM של אלמנטים חדשים
+          walkShadowDOM(node);
+
+          // אם האלמנט החדש עצמו יש לו shadow root, עקוב אחריו
+          if (node.shadowRoot) {
+            observeTarget(node.shadowRoot);
+          }
         }
       }
     }
   });
 
-  observer.observe(document.body, {
+  observer.observe(target, {
     childList: true,
     subtree: true,
     characterData: true
   });
+
+  return observer;
+}
+
+// עקוב אחר shadow roots חדשים שנוצרים דינמית (כמו YouTube chat)
+function observeForShadowRoots(root) {
+  const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          if (node.shadowRoot) {
+            walkDOM(node.shadowRoot);
+            observeTarget(node.shadowRoot);
+            observeForShadowRoots(node.shadowRoot);
+          }
+          // בדוק צאצאים
+          const shadowed = node.querySelectorAll?.("*") || [];
+          for (const el of shadowed) {
+            if (el.shadowRoot) {
+              walkDOM(el.shadowRoot);
+              observeTarget(el.shadowRoot);
+              observeForShadowRoots(el.shadowRoot);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  observer.observe(root, { childList: true, subtree: true });
 }
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "CATEGORIES_UPDATED") {
-    loadReplacements().then(() => walkDOM(document.body));
+    loadReplacements().then(() => walkShadowDOM(document.body));
   }
 });
 
 loadReplacements().then(() => {
-  walkDOM(document.body);
-  startObserver();
+  walkShadowDOM(document.body);
+  observeTarget(document.body);
+  observeForShadowRoots(document.body);
 });
